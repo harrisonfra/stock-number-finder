@@ -24,6 +24,13 @@ h1{font-size:20px;margin:0;font-weight:700}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:11px 16px;border-radius:12px;font-weight:600;font-size:15px}
 .btn.primary{background:#4f8cff;color:#fff}
 .btn.primary:active{background:#3a75e8}
+.btn:not(.primary){background:#171b24;border:1px solid #2a3040;font-size:14px}
+#xfer{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.6);display:flex;align-items:flex-end;justify-content:center}
+.xbody{background:#171b24;border-radius:18px 18px 0 0;padding:16px 16px calc(16px + env(safe-area-inset-bottom));width:100%;max-width:520px;max-height:85vh;overflow:auto}
+.xbody h3{margin:0 0 6px;font-size:17px}
+.xhint{font-size:13px;color:#9aa2b5;line-height:1.5;margin:4px 0 8px}
+.xbody textarea{width:100%;height:110px;background:#0e1116;color:#cfd6e4;border:1px solid #2a3040;border-radius:10px;font:12px ui-monospace,Consolas,monospace;padding:8px;margin:2px 0 10px;resize:vertical}
+.xbody .btn{width:100%;justify-content:center;margin-bottom:8px}
 #engineStatus{font-size:12px;color:#f0b429;flex:1;min-width:120px}
 #gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:10px;padding:12px}
 .card{background:#171b24;border:1px solid #232938;border-radius:14px;overflow:hidden}
@@ -100,6 +107,8 @@ footer{padding:8px 16px 40px;font-size:12px;color:#5d6579;line-height:1.6}
 
 <div class="toolbar">
   <label class="btn primary">📷 Add photos<input id="fileInput" type="file" accept="image/*" multiple hidden></label>
+  <button class="btn" id="btnExport">⇪ Share</button>
+  <button class="btn" id="btnImport">⇩ Import</button>
   <div id="engineStatus"></div>
 </div>
 
@@ -121,6 +130,26 @@ footer{padding:8px 16px 40px;font-size:12px;color:#5d6579;line-height:1.6}
   The first scan needs internet once, to download the free text-reading engine (~5 MB).
   Tip: use your browser's <b>Add to Home Screen</b> so it works like an app and your data is kept safe long-term.
 </footer>
+
+<!-- share / import -->
+<div id="xfer" hidden>
+  <div class="xbody">
+    <h3 id="xTitle">Share</h3>
+    <div id="xExport" hidden>
+      <p class="xhint">Copy this code and paste it into the app on another device — after adding the <b>same photos</b> there. It carries all your tags and matches them to the right photos automatically. Or download the full backup file, which includes the photos too (good for sending to someone else).</p>
+      <textarea id="xOut" readonly></textarea>
+      <button class="btn primary" id="xCopy">📋 Copy code</button>
+      <button class="btn" id="xDownload">💾 Download full backup file (includes photos)</button>
+    </div>
+    <div id="xImport" hidden>
+      <p class="xhint">Paste a code from another device (add the same photos here first), or open a backup file. Imported tags replace the hand-typed tags on matching photos.</p>
+      <textarea id="xIn" placeholder="Paste code here…"></textarea>
+      <button class="btn primary" id="xApply">⇩ Import pasted code</button>
+      <label class="btn">📂 Open backup file<input id="xFile" type="file" accept=".json,application/json,.txt" hidden></label>
+    </div>
+    <button id="xClose" class="btn">Close</button>
+  </div>
+</div>
 
 <!-- photo viewer -->
 <div id="viewer" hidden>
@@ -222,6 +251,229 @@ function enhance(c){
   ctx.putImageData(d, 0, 0);
 }
 
+/* ================= photo fingerprint ================= */
+/* dHash: 64-bit perceptual hash of the image, stable across resizing and
+   re-compression — lets an imported tag code find its photo on another device */
+async function computeHash(source){
+  const img = source instanceof Blob ? await loadImage(source) : source;
+  const c = document.createElement('canvas'); c.width = 9; c.height = 8;
+  const ctx = c.getContext('2d');
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, 0, 0, 9, 8);
+  const d = ctx.getImageData(0, 0, 9, 8).data;
+  const g = [];
+  for (let i = 0; i < 72; i++){ const o = i*4; g.push(d[o]*0.3 + d[o+1]*0.59 + d[o+2]*0.11); }
+  let hex = '', nib = 0, nbits = 0;
+  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++){
+    nib = nib*2 + (g[y*9+x] < g[y*9+x+1] ? 1 : 0);
+    if (++nbits === 4){ hex += nib.toString(16); nib = 0; nbits = 0; }
+  }
+  return hex;
+}
+function hamming(a, b){
+  if (!a || !b || a.length !== b.length) return 64;
+  let d = 0;
+  for (let i = 0; i < a.length; i++){
+    let x = parseInt(a[i], 16) ^ parseInt(b[i], 16);
+    while (x){ d += x & 1; x >>= 1; }
+  }
+  return d;
+}
+async function ensureHash(p){
+  if (!p.hash){
+    try { p.hash = await computeHash(p.blob); await save(p); }
+    catch(e){ console.error('hash failed', e); }
+  }
+  return p.hash;
+}
+
+/* ================= share / import ================= */
+const XPREFIX = 'STOCKFINDER1:';
+function b64encode(str){
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+function b64decode(s){
+  return new TextDecoder().decode(Uint8Array.from(atob(s), c => c.charCodeAt(0)));
+}
+function packBox(b, w, h){
+  return [+(b.x0/w).toFixed(4), +(b.y0/h).toFixed(4), +(b.x1/w).toFixed(4), +(b.y1/h).toFixed(4)];
+}
+function unpackBox(a, w, h){
+  return { x0: Math.round(a[0]*w), y0: Math.round(a[1]*h), x1: Math.round(a[2]*w), y1: Math.round(a[3]*h) };
+}
+/* words serialize as [text, x0,y0,x1,y1, flags] — flags: 1=manual, 2=sold */
+function packWord(w, W, H){ return [w.t, ...packBox(w, W, H), (w.manual?1:0) + (w.sold?2:0)]; }
+function unpackWord(a, W, H){
+  return { t: String(a[0]), ...unpackBox(a.slice(1), W, H),
+           conf: 100, line: 0, manual: !!(a[5] & 1), sold: !!(a[5] & 2) };
+}
+
+/* small copy-paste code: hand-typed tags + labeling progress, no images */
+async function buildTagString(){
+  const out = [];
+  for (const p of photos){
+    await ensureHash(p);
+    out.push({
+      h: p.hash, n: p.name,
+      w: (p.words || []).filter(w => w.manual).map(w => packWord(w, p.w, p.h)),
+      nt: (p.notes || []).map(b => packBox(b, p.w, p.h)),
+      dn: (p.dismissedNotes || []).map(b => packBox(b, p.w, p.h))
+    });
+  }
+  return XPREFIX + b64encode(JSON.stringify({ v: 1, kind: 'tags', photos: out }));
+}
+
+/* full backup: everything including the photos themselves */
+function blobToDataURL(blob){
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result);
+    r.onerror = () => rej(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+async function buildBackup(){
+  const out = [];
+  for (const p of photos){
+    await ensureHash(p);
+    out.push({
+      h: p.hash, n: p.name, c: p.createdAt, w: p.w, hh: p.h,
+      img: await blobToDataURL(p.blob), thumb: p.thumb,
+      words: (p.words || []).map(w => packWord(w, p.w, p.h)),
+      nt: (p.notes || []).map(b => packBox(b, p.w, p.h)),
+      dn: (p.dismissedNotes || []).map(b => packBox(b, p.w, p.h))
+    });
+  }
+  return JSON.stringify({ v: 1, kind: 'backup', photos: out });
+}
+
+function parseTransfer(text){
+  text = text.trim();
+  if (text.startsWith(XPREFIX)) text = b64decode(text.slice(XPREFIX.length));
+  const data = JSON.parse(text);
+  if (!data || !Array.isArray(data.photos)) throw new Error('not a Stock Finder code');
+  return data;
+}
+/* find the local photo this entry belongs to; require a clear best match */
+function matchPhoto(hash){
+  let best = null, bestD = 99, secondD = 99;
+  for (const p of photos){
+    const d = hamming(p.hash, hash);
+    if (d < bestD){ secondD = bestD; bestD = d; best = p; }
+    else if (d < secondD) secondD = d;
+  }
+  return (best && bestD <= 10 && secondD - bestD >= 4) ? best : null;
+}
+
+async function applyTags(data){
+  let matched = 0, tags = 0; const missed = [];
+  for (const p of photos) await ensureHash(p);
+  for (const e of data.photos){
+    const p = matchPhoto(e.h);
+    if (!p){ if ((e.w || []).length) missed.push(e.n || '?'); continue; }
+    matched++;
+    if (e.n) p.name = e.n;
+    p.words = (p.words || []).filter(w => !w.manual);          // local OCR words stay
+    for (const a of (e.w || [])){ p.words.push(unpackWord(a, p.w, p.h)); tags++; }
+    p.dismissedNotes = (e.dn || []).map(a => unpackBox(a, p.w, p.h));
+    if (e.nt){
+      const taken = p.words.filter(w => w.manual).concat(p.dismissedNotes);
+      p.notes = e.nt.map(a => unpackBox(a, p.w, p.h)).filter(b => !taken.some(t => iou(b, t) > 0.2));
+    }
+    await save(p);
+  }
+  render();
+  return { matched, tags, missed };
+}
+
+async function applyBackup(data){
+  let added = 0, updated = 0, tags = 0;
+  for (const p of photos) await ensureHash(p);
+  for (const e of data.photos){
+    const existing = matchPhoto(e.h);
+    if (existing){
+      existing.name = e.n;
+      existing.words = (e.words || []).map(a => unpackWord(a, existing.w, existing.h));
+      existing.notes = (e.nt || []).map(a => unpackBox(a, existing.w, existing.h));
+      existing.dismissedNotes = (e.dn || []).map(a => unpackBox(a, existing.w, existing.h));
+      await save(existing); updated++;
+    } else {
+      const blob = await (await fetch(e.img)).blob();
+      const rec = {
+        name: e.n, createdAt: e.c || Date.now(), w: e.w, h: e.hh, blob, thumb: e.thumb,
+        hash: e.h, status: 'done',
+        words: (e.words || []).map(a => unpackWord(a, e.w, e.hh)),
+        notes: (e.nt || []).map(a => unpackBox(a, e.w, e.hh)),
+        dismissedNotes: (e.dn || []).map(a => unpackBox(a, e.w, e.hh))
+      };
+      rec.id = await dbPut(rec);
+      photos.unshift(rec); added++;
+    }
+    tags += (e.words || []).filter(a => a[5] & 1).length;
+  }
+  photos.sort((a, b) => b.createdAt - a.createdAt);
+  render();
+  return { added, updated, tags };
+}
+
+/* share/import UI */
+function openXfer(mode){
+  $('#xTitle').textContent = mode === 'export' ? 'Share / back up' : 'Import';
+  $('#xExport').hidden = mode !== 'export';
+  $('#xImport').hidden = mode === 'export';
+  $('#xfer').hidden = false;
+}
+$('#btnExport').addEventListener('click', async () => {
+  openXfer('export');
+  $('#xOut').value = 'Building code…';
+  $('#xOut').value = await buildTagString();
+});
+$('#btnImport').addEventListener('click', () => openXfer('import'));
+$('#xClose').addEventListener('click', () => { $('#xfer').hidden = true; });
+$('#xCopy').addEventListener('click', async () => {
+  const t = $('#xOut').value;
+  try { await navigator.clipboard.writeText(t); }
+  catch(e){ $('#xOut').select(); document.execCommand('copy'); }
+  $('#xCopy').textContent = '✅ Copied';
+  setTimeout(() => { $('#xCopy').textContent = '📋 Copy code'; }, 1500);
+});
+$('#xDownload').addEventListener('click', async () => {
+  $('#xDownload').textContent = 'Building backup…';
+  const blob = new Blob([await buildBackup()], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'stock-finder-backup.json';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  $('#xDownload').textContent = '💾 Download full backup file (includes photos)';
+});
+async function runImport(text){
+  try {
+    const data = parseTransfer(text);
+    const r = data.kind === 'backup' ? await applyBackup(data) : await applyTags(data);
+    let msg = data.kind === 'backup'
+      ? `Imported: ${r.added} new photo${r.added === 1 ? '' : 's'}, ${r.updated} updated, ${r.tags} tags.`
+      : `Matched ${r.matched} photo${r.matched === 1 ? '' : 's'}, imported ${r.tags} tags.`;
+    if (r.missed && r.missed.length)
+      msg += `\n\nNo matching photo found for: ${r.missed.join(', ')}. Add those photos here, then import the code again.`;
+    alert(msg);
+    $('#xfer').hidden = true;
+    $('#xIn').value = '';
+    processQueue();
+  } catch(e){
+    alert('Could not read that code: ' + e.message);
+  }
+}
+$('#xApply').addEventListener('click', () => runImport($('#xIn').value));
+$('#xFile').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (f) runImport(await f.text());
+});
+
 /* ================= sticky-note detection ================= */
 /* Finds colored sticky notes (yellow / pink / pale blue / white) that contain
    handwriting, so the user can tap each one and type its number. */
@@ -315,6 +567,7 @@ async function addPhoto(file){
   const rec = {
     name: (file.name || 'photo').replace(/\.[^.]+$/, ''),
     createdAt: Date.now(), w, h, blob, thumb,
+    hash: await computeHash(c),
     status: 'queued', words: []
   };
   rec.id = await dbPut(rec);
