@@ -1,0 +1,904 @@
+'use strict';
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/* ================= IndexedDB ================= */
+let _db = null;
+function db() {
+    if (_db) return Promise.resolve(_db);
+    return new Promise((res, rej) => {
+        const r = indexedDB.open('stockfinder', 1);
+        r.onupgradeneeded = () => r.result.createObjectStore('photos', { keyPath: 'id', autoIncrement: true });
+        r.onsuccess = () => { _db = r.result; res(_db); };
+        r.onerror = () => rej(r.error);
+    });
+}
+function dbReq(mode, fn) {
+    return db().then(d => new Promise((res, rej) => {
+        const t = d.transaction('photos', mode);
+        const req = fn(t.objectStore('photos'));
+        t.oncomplete = () => res(req ? req.result : undefined);
+        t.onerror = () => rej(t.error);
+        t.onabort = () => rej(t.error);
+    }));
+}
+const dbAll = () => dbReq('readonly', s => s.getAll());
+const dbPut = rec => dbReq('readwrite', s => s.put(rec));
+const dbDel = id => dbReq('readwrite', s => s.delete(id));
+
+/* ================= state ================= */
+let photos = [];          // newest first
+let ocrBusy = false;
+let worker = null;
+let curProg = null;       // photo currently being OCR'd (for progress events)
+
+async function save(p) { try { await dbPut(p); } catch (e) { console.error('save failed', e); } }
+
+/* ================= image helpers ================= */
+async function loadImage(file) {
+    try { return await createImageBitmap(file, { imageOrientation: 'from-image' }); }
+    catch (e) {
+        return await new Promise((res, rej) => {
+            const u = URL.createObjectURL(file);
+            const i = new Image();
+            i.onload = () => { URL.revokeObjectURL(u); res(i); };
+            i.onerror = () => { URL.revokeObjectURL(u); rej(new Error('unsupported image format')); };
+            i.src = u;
+        });
+    }
+}
+function blobToCanvas(blob) {
+    return loadImage(blob).then(img => {
+        const c = document.createElement('canvas');
+        c.width = img.width; c.height = img.height;
+        c.getContext('2d').drawImage(img, 0, 0);
+        return c;
+    });
+}
+/* grayscale + contrast stretch — helps the OCR read marker on cardboard */
+function enhance(c) {
+    const ctx = c.getContext('2d');
+    const d = ctx.getImageData(0, 0, c.width, c.height);
+    const a = d.data, n = a.length / 4;
+    const hist = new Uint32Array(256);
+    for (let i = 0; i < a.length; i += 4) {
+        const g = (a[i] * 3 + a[i + 1] * 6 + a[i + 2]) / 10 | 0;
+        a[i] = g; hist[g]++;
+    }
+    let lo = 0, hi = 255, acc = 0; const cut = n * 0.02;
+    for (let i = 0; i < 256; i++) { acc += hist[i]; if (acc >= cut) { lo = i; break; } }
+    acc = 0;
+    for (let i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= cut) { hi = i; break; } }
+    const range = Math.max(1, hi - lo);
+    for (let i = 0; i < a.length; i += 4) {
+        let v = (a[i] - lo) * 255 / range;
+        v = v < 0 ? 0 : v > 255 ? 255 : v;
+        a[i] = a[i + 1] = a[i + 2] = v;
+    }
+    ctx.putImageData(d, 0, 0);
+}
+
+/* ================= photo fingerprint ================= */
+/* dHash: 64-bit perceptual hash of the image, stable across resizing and
+   re-compression — lets an imported tag code find its photo on another device */
+async function computeHash(source) {
+    const img = source instanceof Blob ? await loadImage(source) : source;
+    const c = document.createElement('canvas'); c.width = 9; c.height = 8;
+    const ctx = c.getContext('2d');
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, 9, 8);
+    const d = ctx.getImageData(0, 0, 9, 8).data;
+    const g = [];
+    for (let i = 0; i < 72; i++) { const o = i * 4; g.push(d[o] * 0.3 + d[o + 1] * 0.59 + d[o + 2] * 0.11); }
+    let hex = '', nib = 0, nbits = 0;
+    for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
+        nib = nib * 2 + (g[y * 9 + x] < g[y * 9 + x + 1] ? 1 : 0);
+        if (++nbits === 4) { hex += nib.toString(16); nib = 0; nbits = 0; }
+    }
+    return hex;
+}
+function hamming(a, b) {
+    if (!a || !b || a.length !== b.length) return 64;
+    let d = 0;
+    for (let i = 0; i < a.length; i++) {
+        let x = parseInt(a[i], 16) ^ parseInt(b[i], 16);
+        while (x) { d += x & 1; x >>= 1; }
+    }
+    return d;
+}
+async function ensureHash(p) {
+    if (!p.hash) {
+        try { p.hash = await computeHash(p.blob); await save(p); }
+        catch (e) { console.error('hash failed', e); }
+    }
+    return p.hash;
+}
+
+/* ================= share / import ================= */
+const XPREFIX = 'STOCKFINDER1:';
+function b64encode(str) {
+    const bytes = new TextEncoder().encode(str);
+    let bin = '';
+    for (const b of bytes) bin += String.fromCharCode(b);
+    return btoa(bin);
+}
+function b64decode(s) {
+    return new TextDecoder().decode(Uint8Array.from(atob(s), c => c.charCodeAt(0)));
+}
+function packBox(b, w, h) {
+    return [+(b.x0 / w).toFixed(4), +(b.y0 / h).toFixed(4), +(b.x1 / w).toFixed(4), +(b.y1 / h).toFixed(4)];
+}
+function unpackBox(a, w, h) {
+    return { x0: Math.round(a[0] * w), y0: Math.round(a[1] * h), x1: Math.round(a[2] * w), y1: Math.round(a[3] * h) };
+}
+/* words serialize as [text, x0,y0,x1,y1, flags] — flags: 1=manual, 2=sold */
+function packWord(w, W, H) { return [w.t, ...packBox(w, W, H), (w.manual ? 1 : 0) + (w.sold ? 2 : 0)]; }
+function unpackWord(a, W, H) {
+    return {
+        t: String(a[0]), ...unpackBox(a.slice(1), W, H),
+        conf: 100, line: 0, manual: !!(a[5] & 1), sold: !!(a[5] & 2)
+    };
+}
+
+/* small copy-paste code: hand-typed tags + labeling progress, no images */
+async function buildTagString() {
+    const out = [];
+    for (const p of photos) {
+        await ensureHash(p);
+        out.push({
+            h: p.hash, n: p.name,
+            w: (p.words || []).filter(w => w.manual).map(w => packWord(w, p.w, p.h)),
+            nt: (p.notes || []).map(b => packBox(b, p.w, p.h)),
+            dn: (p.dismissedNotes || []).map(b => packBox(b, p.w, p.h))
+        });
+    }
+    return XPREFIX + b64encode(JSON.stringify({ v: 1, kind: 'tags', photos: out }));
+}
+
+/* full backup: everything including the photos themselves */
+function blobToDataURL(blob) {
+    return new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload = () => res(r.result);
+        r.onerror = () => rej(r.error);
+        r.readAsDataURL(blob);
+    });
+}
+async function buildBackup() {
+    const out = [];
+    for (const p of photos) {
+        await ensureHash(p);
+        out.push({
+            h: p.hash, n: p.name, c: p.createdAt, w: p.w, hh: p.h,
+            img: await blobToDataURL(p.blob), thumb: p.thumb,
+            words: (p.words || []).map(w => packWord(w, p.w, p.h)),
+            nt: (p.notes || []).map(b => packBox(b, p.w, p.h)),
+            dn: (p.dismissedNotes || []).map(b => packBox(b, p.w, p.h))
+        });
+    }
+    return JSON.stringify({ v: 1, kind: 'backup', photos: out });
+}
+
+function parseTransfer(text) {
+    text = text.trim();
+    if (text.startsWith(XPREFIX)) text = b64decode(text.slice(XPREFIX.length));
+    const data = JSON.parse(text);
+    if (!data || !Array.isArray(data.photos)) throw new Error('not a Stock Finder code');
+    return data;
+}
+/* find the local photo this entry belongs to; require a clear best match */
+function matchPhoto(hash) {
+    let best = null, bestD = 99, secondD = 99;
+    for (const p of photos) {
+        const d = hamming(p.hash, hash);
+        if (d < bestD) { secondD = bestD; bestD = d; best = p; }
+        else if (d < secondD) secondD = d;
+    }
+    return (best && bestD <= 10 && secondD - bestD >= 4) ? best : null;
+}
+
+async function applyTags(data) {
+    let matched = 0, tags = 0; const missed = [];
+    for (const p of photos) await ensureHash(p);
+    for (const e of data.photos) {
+        const p = matchPhoto(e.h);
+        if (!p) { if ((e.w || []).length) missed.push(e.n || '?'); continue; }
+        matched++;
+        if (e.n) p.name = e.n;
+        p.words = (p.words || []).filter(w => !w.manual);          // local OCR words stay
+        for (const a of (e.w || [])) { p.words.push(unpackWord(a, p.w, p.h)); tags++; }
+        p.dismissedNotes = (e.dn || []).map(a => unpackBox(a, p.w, p.h));
+        if (e.nt) {
+            const taken = p.words.filter(w => w.manual).concat(p.dismissedNotes);
+            p.notes = e.nt.map(a => unpackBox(a, p.w, p.h)).filter(b => !taken.some(t => iou(b, t) > 0.2));
+        }
+        await save(p);
+    }
+    render();
+    return { matched, tags, missed };
+}
+
+async function applyBackup(data) {
+    let added = 0, updated = 0, tags = 0;
+    for (const p of photos) await ensureHash(p);
+    for (const e of data.photos) {
+        const existing = matchPhoto(e.h);
+        if (existing) {
+            existing.name = e.n;
+            existing.words = (e.words || []).map(a => unpackWord(a, existing.w, existing.h));
+            existing.notes = (e.nt || []).map(a => unpackBox(a, existing.w, existing.h));
+            existing.dismissedNotes = (e.dn || []).map(a => unpackBox(a, existing.w, existing.h));
+            await save(existing); updated++;
+        } else {
+            const blob = await (await fetch(e.img)).blob();
+            const rec = {
+                name: e.n, createdAt: e.c || Date.now(), w: e.w, h: e.hh, blob, thumb: e.thumb,
+                hash: e.h, status: 'done',
+                words: (e.words || []).map(a => unpackWord(a, e.w, e.hh)),
+                notes: (e.nt || []).map(a => unpackBox(a, e.w, e.hh)),
+                dismissedNotes: (e.dn || []).map(a => unpackBox(a, e.w, e.hh))
+            };
+            rec.id = await dbPut(rec);
+            photos.unshift(rec); added++;
+        }
+        tags += (e.words || []).filter(a => a[5] & 1).length;
+    }
+    photos.sort((a, b) => b.createdAt - a.createdAt);
+    render();
+    return { added, updated, tags };
+}
+
+/* share/import UI */
+function openXfer(mode) {
+    $('#xTitle').textContent = mode === 'export' ? 'Share / back up' : 'Import';
+    $('#xExport').hidden = mode !== 'export';
+    $('#xImport').hidden = mode === 'export';
+    $('#xfer').hidden = false;
+}
+$('#btnExport').addEventListener('click', async () => {
+    openXfer('export');
+    $('#xOut').value = 'Building code…';
+    $('#xOut').value = await buildTagString();
+});
+$('#btnImport').addEventListener('click', () => openXfer('import'));
+$('#xClose').addEventListener('click', () => { $('#xfer').hidden = true; });
+$('#xCopy').addEventListener('click', async () => {
+    const t = $('#xOut').value;
+    try { await navigator.clipboard.writeText(t); }
+    catch (e) { $('#xOut').select(); document.execCommand('copy'); }
+    $('#xCopy').textContent = '✅ Copied';
+    setTimeout(() => { $('#xCopy').textContent = '📋 Copy code'; }, 1500);
+});
+$('#xDownload').addEventListener('click', async () => {
+    $('#xDownload').textContent = 'Building backup…';
+    const blob = new Blob([await buildBackup()], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'stock-finder-backup.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    $('#xDownload').textContent = '💾 Download full backup file (includes photos)';
+});
+async function runImport(text) {
+    try {
+        const data = parseTransfer(text);
+        const r = data.kind === 'backup' ? await applyBackup(data) : await applyTags(data);
+        let msg = data.kind === 'backup'
+            ? `Imported: ${r.added} new photo${r.added === 1 ? '' : 's'}, ${r.updated} updated, ${r.tags} tags.`
+            : `Matched ${r.matched} photo${r.matched === 1 ? '' : 's'}, imported ${r.tags} tags.`;
+        if (r.missed && r.missed.length)
+            msg += `\n\nNo matching photo found for: ${r.missed.join(', ')}. Add those photos here, then import the code again.`;
+        alert(msg);
+        $('#xfer').hidden = true;
+        $('#xIn').value = '';
+        processQueue();
+    } catch (e) {
+        alert('Could not read that code: ' + e.message);
+    }
+}
+$('#xApply').addEventListener('click', () => runImport($('#xIn').value));
+$('#xFile').addEventListener('change', async e => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (f) runImport(await f.text());
+});
+
+/* ================= sticky-note detection ================= */
+/* Finds colored sticky notes (yellow / pink / pale blue / white) that contain
+   handwriting, so the user can tap each one and type its number. */
+function detectNotes(c) {
+    const W = c.width, H = c.height;
+    const d = c.getContext('2d').getImageData(0, 0, W, H).data;
+    const mask = new Uint8Array(W * H), lum = new Uint8Array(W * H);
+    for (let i = 0, px = 0; px < W * H; px++, i += 4) {
+        const r = d[i], g = d[i + 1], b = d[i + 2];
+        lum[px] = (r * 3 + g * 6 + b) / 10 | 0;
+        const mx = Math.max(r, g, b), spread = mx - Math.min(r, g, b);
+        let cls = 0;
+        if (r > 140 && g > 115 && b < g * 0.75 && Math.abs(r - g) < 70) cls = 1;                 // yellow
+        else if (r > 150 && b > 120 && g < r * 0.88 && b > g * 1.02) cls = 2;                    // pink
+        else if (b > 140 && b > r * 1.06 && g > 110 && spread > 12 && spread < 90) cls = 3;        // pale blue
+        else if (mx > 200 && spread < 30) cls = 4;                                           // white
+        mask[px] = cls;
+    }
+    const seen = new Uint8Array(W * H), stack = new Int32Array(W * H), out = [];
+    for (let p0 = 0; p0 < W * H; p0++) {
+        if (!mask[p0] || seen[p0]) continue;
+        const cls = mask[p0];
+        let sp = 0; stack[sp++] = p0; seen[p0] = 1;
+        let n = 0, x0 = W, y0 = H, x1 = 0, y1 = 0, lsum = 0;
+        while (sp) {
+            const p = stack[--sp]; n++; lsum += lum[p];
+            const x = p % W, y = (p / W) | 0;
+            if (x < x0) x0 = x; if (x > x1) x1 = x;
+            if (y < y0) y0 = y; if (y > y1) y1 = y;
+            if (x > 0 && mask[p - 1] === cls && !seen[p - 1]) { seen[p - 1] = 1; stack[sp++] = p - 1; }
+            if (x < W - 1 && mask[p + 1] === cls && !seen[p + 1]) { seen[p + 1] = 1; stack[sp++] = p + 1; }
+            if (y > 0 && mask[p - W] === cls && !seen[p - W]) { seen[p - W] = 1; stack[sp++] = p - W; }
+            if (y < H - 1 && mask[p + W] === cls && !seen[p + W]) { seen[p + W] = 1; stack[sp++] = p + W; }
+        }
+        const bw = x1 - x0 + 1, bh = y1 - y0 + 1, area = W * H;
+        if (n < area * 0.0004 || n > area * 0.06) continue;   // too small / too big
+        if (n / (bw * bh) < 0.5) continue;                  // not a solid rectangle
+        const ar = bw / bh;
+        if (ar < 0.3 || ar > 3.5) continue;
+        // must contain "ink" — dark strokes on the note
+        const thr = (lsum / n) * 0.62;
+        let dark = 0;
+        for (let y = y0; y <= y1; y++)
+            for (let x = x0; x <= x1; x++)
+                if (lum[y * W + x] < thr) dark++;
+        const dr = dark / (bw * bh);
+        if (dr < 0.008 || dr > 0.5) continue;
+        out.push({ x0, y0, x1, y1 });
+    }
+    return out;
+}
+function iou(a, b) {
+    const ix = Math.max(0, Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0));
+    const iy = Math.max(0, Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0));
+    const inter = ix * iy;
+    const ua = (a.x1 - a.x0) * (a.y1 - a.y0) + (b.x1 - b.x0) * (b.y1 - b.y0) - inter;
+    return ua > 0 ? inter / ua : 0;
+}
+async function findNotes(p) {
+    const c = await blobToCanvas(p.blob);
+    const ds = 800 / Math.max(c.width, c.height);
+    const dc = document.createElement('canvas');
+    dc.width = Math.max(1, Math.round(c.width * ds));
+    dc.height = Math.max(1, Math.round(c.height * ds));
+    dc.getContext('2d').drawImage(c, 0, 0, dc.width, dc.height);
+    const boxes = detectNotes(dc).map(b => ({
+        x0: Math.max(0, Math.round(b.x0 / ds - p.w * 0.005)),
+        y0: Math.max(0, Math.round(b.y0 / ds - p.h * 0.005)),
+        x1: Math.min(p.w, Math.round(b.x1 / ds + p.w * 0.005)),
+        y1: Math.min(p.h, Math.round(b.y1 / ds + p.h * 0.005))
+    }));
+    // skip notes already labeled (manual tag there) or previously dismissed
+    const taken = (p.words || []).filter(w => w.manual).concat(p.dismissedNotes || []);
+    return boxes.filter(b => !taken.some(t => iou(b, t) > 0.2));
+}
+
+/* ================= adding photos ================= */
+async function addPhoto(file) {
+    const img = await loadImage(file);
+    const scale = Math.min(1, 2600 / Math.max(img.width, img.height));
+    const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    c.getContext('2d').drawImage(img, 0, 0, w, h);
+    const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.85));
+    if (!blob) throw new Error('could not process image');
+    const ts = Math.min(1, 420 / Math.max(w, h));
+    const tc = document.createElement('canvas');
+    tc.width = Math.max(1, Math.round(w * ts)); tc.height = Math.max(1, Math.round(h * ts));
+    tc.getContext('2d').drawImage(c, 0, 0, tc.width, tc.height);
+    const thumb = tc.toDataURL('image/jpeg', 0.6);
+    const rec = {
+        name: (file.name || 'photo').replace(/\.[^.]+$/, ''),
+        createdAt: Date.now(), w, h, blob, thumb,
+        hash: await computeHash(c),
+        status: 'queued', words: []
+    };
+    rec.id = await dbPut(rec);
+    photos.unshift(rec);
+    render();
+    return rec;
+}
+
+$('#fileInput').addEventListener('change', async e => {
+    const files = [...e.target.files];
+    e.target.value = '';
+    for (const f of files) {
+        try { await addPhoto(f); }
+        catch (err) { alert('Could not add ' + f.name + ': ' + err.message); }
+    }
+    processQueue();
+});
+
+/* ================= OCR ================= */
+function engineStatus(msg) { $('#engineStatus').textContent = msg; }
+
+async function getWorker() {
+    if (worker) return worker;
+    engineStatus('Downloading text-reading engine (first time only)…');
+    worker = await Tesseract.createWorker('eng', 1, {
+        logger: m => {
+            if (m.status === 'recognizing text' && curProg) {
+                curProg.progress = Math.round(m.progress * 100);
+                const b = document.querySelector('.badge[data-id="' + curProg.id + '"]');
+                if (b) b.textContent = '🔍 reading ' + curProg.progress + '%';
+            }
+        }
+    });
+    await worker.setParameters({ tessedit_pageseg_mode: '11', user_defined_dpi: '300' });
+    engineStatus('');
+    return worker;
+}
+
+async function processQueue() {
+    if (ocrBusy) return;
+    ocrBusy = true;
+    try {
+        let p;
+        while ((p = photos.find(x => x.status === 'queued'))) await ocrPhoto(p);
+    } finally {
+        ocrBusy = false;
+        engineStatus('');
+    }
+}
+
+async function ocrPhoto(p) {
+    p.status = 'ocr'; p.progress = 0; render();
+    try { p.notes = await findNotes(p); }
+    catch (e) { console.error('note detection failed', e); p.notes = p.notes || []; }
+    if (!window.Tesseract) {
+        // note detection is local and already done — only printed-text reading needs the engine
+        p.status = 'done';
+        if (!photos.includes(p)) return;   // deleted while scanning
+        await save(p); render(); return;
+    }
+    try {
+        const wk = await getWorker();
+        const c = await blobToCanvas(p.blob);
+        enhance(c);
+        curProg = p;
+        const { data } = await wk.recognize(c, {}, { blocks: true, text: true });
+        p.words = (p.words || []).filter(w => w.manual);   // keep hand-placed tags on re-scan
+        let line = 0;
+        const blocks = data.blocks || [];
+        for (const b of blocks)
+            for (const par of (b.paragraphs || []))
+                for (const ln of (par.lines || [])) {
+                    line++;
+                    for (const w of (ln.words || [])) {
+                        const t = (w.text || '').trim();
+                        if (!t || !w.bbox) continue;
+                        p.words.push({
+                            t, x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1,
+                            conf: Math.round(w.confidence || 0), line
+                        });
+                    }
+                }
+        p.status = 'done';
+        delete p.error;
+    } catch (err) {
+        console.error(err);
+        p.status = 'error';
+        p.error = (err && err.message) || 'reading failed';
+    }
+    curProg = null;
+    if (!photos.includes(p)) return;     // deleted while scanning
+    await save(p);
+    if (vp === p) renderBoxes();         // viewer is showing this photo
+    render();
+}
+
+/* ================= search ================= */
+/* handwriting OCR confuses these — map both the query and the OCR text the same way */
+const CONFUSE = { O: '0', Q: '0', D: '0', I: '1', L: '1', Z: '2', S: '5', B: '8', G: '6' };
+function norm(s) {
+    let out = '';
+    for (const ch of String(s).toUpperCase()) {
+        if (/[A-Z0-9]/.test(ch)) out += CONFUSE[ch] || ch;
+    }
+    return out;
+}
+/* true if edit distance between a and b is <= 1 */
+function within1(a, b) {
+    if (a === b) return true;
+    const la = a.length, lb = b.length;
+    if (Math.abs(la - lb) > 1) return false;
+    if (la > lb) return within1(b, a);
+    let i = 0, j = 0, edits = 0;
+    while (i < la && j < lb) {
+        if (a[i] === b[j]) { i++; j++; continue; }
+        if (++edits > 1) return false;
+        if (la === lb) { i++; j++; } else { j++; }
+    }
+    edits += (lb - j) + (la - i);
+    return edits <= 1;
+}
+function matchRanges(s, q) {
+    const out = [];
+    let i = s.indexOf(q);
+    while (i !== -1) { out.push([i, i + q.length]); i = s.indexOf(q, i + 1); }
+    if (out.length || q.length < 5) return out;
+    for (let st = 0; st < s.length; st++)
+        for (const len of [q.length, q.length - 1, q.length + 1]) {
+            const en = st + len;
+            if (en > s.length) continue;
+            if (within1(s.slice(st, en), q)) { out.push([st, en]); return out; }
+        }
+    return out;
+}
+/* find matches in one photo; numbers split across words on a line are joined */
+function findHits(p, q) {
+    if (!p.words || !p.words.length) return [];
+    const lines = new Map();
+    p.words.forEach((w, idx) => {
+        const k = w.manual ? 'm' + idx : 'l' + w.line;
+        if (!lines.has(k)) lines.set(k, []);
+        lines.get(k).push(idx);
+    });
+    const hits = [], seen = new Set();
+    for (const idxs of lines.values()) {
+        let s = ''; const spans = [];
+        for (const idx of idxs) {
+            const n = norm(p.words[idx].t);
+            if (!n) continue;
+            spans.push([s.length, s.length + n.length, idx]);
+            s += n;
+        }
+        if (!s) continue;
+        for (const [st, en] of matchRanges(s, q)) {
+            const wordIdxs = spans.filter(sp => sp[0] < en && sp[1] > st).map(sp => sp[2]);
+            if (!wordIdxs.length) continue;
+            const key = wordIdxs.join(',');
+            if (seen.has(key)) continue;
+            seen.add(key);
+            hits.push({
+                words: wordIdxs,
+                text: wordIdxs.map(i => p.words[i].t).join(' '),
+                sold: wordIdxs.every(i => p.words[i].sold),
+                exact: s.slice(st, en) === q
+            });
+        }
+    }
+    return hits;
+}
+function searchAll(qraw) {
+    const q = norm(qraw);
+    if (q.length < 3) return [];
+    const res = [];
+    for (const p of photos) {
+        const hits = findHits(p, q);
+        if (hits.length) res.push({ p, hits });
+    }
+    return res;
+}
+
+/* ================= candidate numbers (chips) ================= */
+function candidateIdxs(p) {
+    const out = [];
+    (p.words || []).forEach((w, i) => {
+        const n = norm(w.t);
+        const digits = (n.match(/[0-9]/g) || []).length;
+        if (w.manual || (n.length >= 4 && digits >= 3)) out.push(i);
+    });
+    return out;
+}
+function chipGroups(p) {
+    const m = new Map();
+    for (const i of candidateIdxs(p)) {
+        const w = p.words[i];
+        const key = norm(w.t) || 'm' + i;
+        const g = m.get(key) || { text: w.t, idxs: [], sold: true, manual: false };
+        g.idxs.push(i);
+        g.sold = g.sold && !!w.sold;
+        g.manual = g.manual || !!w.manual;
+        m.set(key, g);
+    }
+    return [...m.values()];
+}
+
+/* ================= rendering ================= */
+function render() {
+    const q = $('#search').value.trim();
+    const searching = norm(q).length >= 3;
+    $('#results').hidden = !searching;
+    $('#gallery').hidden = searching;
+    $('#empty').hidden = photos.length > 0 || searching;
+    if (searching) renderResults(q); else renderGallery();
+    updateStorage();
+}
+
+function badgeText(p) {
+    if (p.status === 'queued') return '⏳ waiting to scan';
+    if (p.status === 'ocr') return '🔍 reading ' + (p.progress || 0) + '%';
+    if (p.status === 'error') return '⚠️ failed — tap ↻';
+    const n = chipGroups(p).length;
+    const todo = (p.notes || []).length;
+    let s = n ? n + ' number' + (n === 1 ? '' : 's') : 'no numbers yet';
+    if (todo) s += ' · 🏷 ' + todo;
+    return s;
+}
+
+function renderGallery() {
+    $('#gallery').innerHTML = photos.map(p => {
+        const todo = (p.notes || []).length;
+        const chips = (todo ? `<button class="chip todo" data-act="open" data-id="${p.id}">🏷 label ${todo} note${todo === 1 ? '' : 's'}</button>` : '')
+            + chipGroups(p).map(g =>
+                `<button class="chip${g.manual ? ' manual' : ''}${g.sold ? ' sold' : ''}" data-id="${p.id}" data-words="${g.idxs.join(',')}">${esc(g.text)}</button>`
+            ).join('');
+        return `<div class="card">
+      <div class="thumbwrap" data-act="open" data-id="${p.id}">
+        <img src="${p.thumb}" alt="">
+        <span class="badge${p.status === 'error' ? ' err' : ''}" data-id="${p.id}">${badgeText(p)}</span>
+        <button class="iconbtn del" data-act="del" data-id="${p.id}" title="Delete photo">✕</button>
+        ${p.status !== 'queued' && p.status !== 'ocr' ? `<button class="iconbtn retry" data-act="retry" data-id="${p.id}" title="Re-scan">↻</button>` : ''}
+      </div>
+      <div class="cardname" data-act="rename" data-id="${p.id}">${esc(p.name)}</div>
+      ${chips ? `<div class="chips">${chips}</div>` : `<div class="nochips">${p.status === 'done' ? 'tap photo → ＋ Tag to add numbers' : '&nbsp;'}</div>`}
+    </div>`;
+    }).join('');
+}
+
+function renderResults(q) {
+    const res = searchAll(q);
+    const pending = photos.filter(p => p.status === 'queued' || p.status === 'ocr').length;
+    let html = res.map(({ p, hits }) => {
+        const chips = hits.map(h =>
+            `<button class="chip hitchip${h.sold ? ' sold' : ''}" data-id="${p.id}" data-words="${h.words.join(',')}">📍 ${esc(h.text)}</button>`
+        ).join('');
+        return `<div class="rescard">
+      <img src="${p.thumb}" alt="" data-act="open" data-id="${p.id}" data-words="${hits.flatMap(h => h.words).join(',')}">
+      <div class="resinfo">
+        <div class="resname">${esc(p.name)}</div>
+        <div class="chips">${chips}</div>
+      </div>
+    </div>`;
+    }).join('');
+    if (!res.length) {
+        html += `<div class="resnote">No match for “${esc(q)}”. Try typing fewer digits (the middle chunk of the number works well). If it's still missing, open the photo and add it with <b>＋ Tag</b>.</div>`;
+    }
+    if (pending) html += `<div class="resnote">⏳ ${pending} photo${pending === 1 ? ' is' : 's are'} still being read…</div>`;
+    $('#results').innerHTML = html;
+}
+
+async function updateStorage() {
+    try {
+        if (!navigator.storage || !navigator.storage.estimate) return;
+        const est = await navigator.storage.estimate();
+        const mb = (est.usage || 0) / 1048576;
+        $('#storageInfo').textContent = photos.length + ' photos · ' + (mb < 1 ? '<1' : Math.round(mb)) + ' MB';
+    } catch (e) { }
+}
+
+/* clicks in gallery + results */
+function listClick(e) {
+    const el = e.target.closest('[data-act],[data-words]');
+    if (!el) return;
+    const id = Number(el.dataset.id);
+    const act = el.dataset.act;
+    if (act === 'del') {
+        const p = photos.find(x => x.id === id);
+        if (p && confirm('Delete this photo and its numbers?')) {
+            dbDel(id);
+            photos = photos.filter(x => x.id !== id);
+            render();
+        }
+        return;
+    }
+    if (act === 'retry') {
+        const p = photos.find(x => x.id === id);
+        if (p) { p.status = 'queued'; render(); processQueue(); }
+        return;
+    }
+    if (act === 'rename') {
+        const p = photos.find(x => x.id === id);
+        if (!p) return;
+        const v = prompt('Photo name (e.g. “garage shelf left”):', p.name);
+        if (v && v.trim()) { p.name = v.trim(); save(p); render(); }
+        return;
+    }
+    const words = el.dataset.words ? el.dataset.words.split(',').filter(Boolean).map(Number) : [];
+    openViewer(id, words);
+}
+$('#gallery').addEventListener('click', listClick);
+$('#results').addEventListener('click', listClick);
+
+/* search box */
+let searchTimer = null;
+$('#search').addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(render, 120);
+});
+$('#clearSearch').addEventListener('click', () => {
+    $('#search').value = '';
+    render();
+});
+
+/* ================= viewer ================= */
+let vp = null, vHits = new Set(), vZoom = 1, vFit = 1, vURL = null, tagMode = false;
+
+async function openViewer(id, hitIdxs) {
+    vp = photos.find(p => p.id === id);
+    if (!vp) return;
+    vHits = new Set(hitIdxs || []);
+    tagMode = false;
+    $('#vAddTag').classList.remove('on');
+    $('#vWrap').classList.remove('tagging');
+    $('#vName').textContent = vp.name;
+    $('#viewer').hidden = false;
+    document.body.style.overflow = 'hidden';
+    if (vURL) URL.revokeObjectURL(vURL);
+    vURL = URL.createObjectURL(vp.blob);
+    const img = $('#vImg');
+    await new Promise(res => { img.onload = res; img.onerror = res; img.src = vURL; });
+    vFit = Math.min($('#vScroll').clientWidth / vp.w, $('#vScroll').clientHeight / vp.h);
+    setZoom(vHits.size ? Math.max(vFit * 2.2, 0.35) : vFit, false);
+    renderBoxes();
+    if (vHits.size) requestAnimationFrame(scrollToFirstHit);
+}
+function closeViewer() {
+    $('#viewer').hidden = true;
+    document.body.style.overflow = '';
+    if (vURL) { URL.revokeObjectURL(vURL); vURL = null; }
+    vp = null;
+    render();
+}
+$('#vClose').addEventListener('click', closeViewer);
+
+function setZoom(z, keepCenter = true) {
+    const sc = $('#vScroll');
+    const cx = keepCenter ? (sc.scrollLeft + sc.clientWidth / 2) / (vp.w * vZoom) : 0.5;
+    const cy = keepCenter ? (sc.scrollTop + sc.clientHeight / 2) / (vp.h * vZoom) : 0.5;
+    vZoom = Math.max(vFit * 0.5, Math.min(vFit * 10, z));
+    $('#vWrap').style.width = vp.w * vZoom + 'px';
+    $('#vWrap').style.height = vp.h * vZoom + 'px';
+    sc.scrollLeft = cx * vp.w * vZoom - sc.clientWidth / 2;
+    sc.scrollTop = cy * vp.h * vZoom - sc.clientHeight / 2;
+}
+$('#vZoomIn').addEventListener('click', () => setZoom(vZoom * 1.6));
+$('#vZoomOut').addEventListener('click', () => setZoom(vZoom / 1.6));
+$('#vZoomFit').addEventListener('click', () => setZoom(vFit));
+$('#vShowAll').addEventListener('change', renderBoxes);
+
+function renderBoxes() {
+    if (!vp) return;
+    const showAll = $('#vShowAll').checked;
+    const cand = new Set(candidateIdxs(vp));
+    $('#vBoxes').innerHTML = (vp.words || []).map((w, idx) => {
+        const show = vHits.has(idx) || w.manual || (showAll && cand.has(idx));
+        if (!show) return '';
+        const cls = 'box' + (vHits.has(idx) ? ' hit' : '') + (w.manual ? ' manual' : '') + (w.sold ? ' sold' : '');
+        const l = w.x0 / vp.w * 100, t = w.y0 / vp.h * 100;
+        const ww = Math.max(0.8, (w.x1 - w.x0) / vp.w * 100), hh = Math.max(0.8, (w.y1 - w.y0) / vp.h * 100);
+        const showLbl = vHits.has(idx) || w.manual;
+        return `<div class="${cls}" data-idx="${idx}" style="left:${l}%;top:${t}%;width:${ww}%;height:${hh}%">${showLbl ? `<span class="lbl">${esc(w.t)}</span>` : ''}</div>`;
+    }).join('') + (vp.notes || []).map((nb, i) => {
+        const l = nb.x0 / vp.w * 100, t = nb.y0 / vp.h * 100;
+        const ww = (nb.x1 - nb.x0) / vp.w * 100, hh = (nb.y1 - nb.y0) / vp.h * 100;
+        return `<div class="box note" data-note="${i}" style="left:${l}%;top:${t}%;width:${ww}%;height:${hh}%"><span class="lbl">tap to label</span></div>`;
+    }).join('');
+}
+function scrollToFirstHit() {
+    const first = Math.min(...vHits);
+    const w = vp.words[first];
+    if (!w) return;
+    const sc = $('#vScroll');
+    sc.scrollLeft = (w.x0 + w.x1) / 2 * vZoom - sc.clientWidth / 2;
+    sc.scrollTop = (w.y0 + w.y1) / 2 * vZoom - sc.clientHeight / 2;
+}
+
+/* add tag mode */
+$('#vAddTag').addEventListener('click', () => {
+    tagMode = !tagMode;
+    $('#vAddTag').classList.toggle('on', tagMode);
+    $('#vWrap').classList.toggle('tagging', tagMode);
+});
+$('#vWrap').addEventListener('click', e => {
+    if (!vp) return;
+    const boxEl = e.target.closest('.box');
+    if (boxEl) {
+        if (boxEl.dataset.note !== undefined) openNoteSheet(Number(boxEl.dataset.note));
+        else openSheet(Number(boxEl.dataset.idx));
+        return;
+    }
+    if (!tagMode) return;
+    const rect = $('#vWrap').getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width * vp.w;
+    const y = (e.clientY - rect.top) / rect.height * vp.h;
+    const val = prompt('Stock number for this spot:');
+    if (!val || !val.trim()) return;
+    const bw = vp.w * 0.07, bh = vp.h * 0.035;
+    vp.words.push({
+        t: val.trim(),
+        x0: Math.max(0, Math.round(x - bw / 2)), y0: Math.max(0, Math.round(y - bh / 2)),
+        x1: Math.min(vp.w, Math.round(x + bw / 2)), y1: Math.min(vp.h, Math.round(y + bh / 2)),
+        conf: 100, line: 0, manual: true
+    });
+    save(vp);
+    renderBoxes();
+});
+
+/* ================= action sheet ================= */
+function openSheet(idx) {
+    const w = vp && vp.words[idx];
+    if (!w) return;
+    $('#sheet').innerHTML = `<div class="sheetbody">
+    <div class="sheettitle">${w.manual ? 'Tag' : 'Detected'}${w.sold ? ' · SOLD' : ''}<b>${esc(w.t)}</b></div>
+    <button data-sact="sold">${w.sold ? '↩️ Mark as available again' : '✅ Mark as sold'}</button>
+    <button data-sact="edit">✏️ Fix / edit number</button>
+    <button data-sact="delete" class="danger">🗑 Remove this tag</button>
+    <button data-sact="cancel" class="cancel">Cancel</button>
+  </div>`;
+    $('#sheet').hidden = false;
+    $('#sheet').onclick = e => {
+        const b = e.target.closest('[data-sact]');
+        const act = b ? b.dataset.sact : 'cancel';   // tap outside = cancel
+        if (act === 'sold') { w.sold = !w.sold; save(vp); renderBoxes(); }
+        else if (act === 'edit') {
+            const v = prompt('Stock number:', w.t);
+            if (v && v.trim()) { w.t = v.trim(); save(vp); renderBoxes(); }
+        }
+        else if (act === 'delete') {
+            const cur = vp.words.indexOf(w);   // list may have changed while sheet was open
+            if (cur !== -1 && confirm('Remove this tag? (The photo stays.)')) {
+                vp.words.splice(cur, 1);
+                vHits = new Set();      // indexes shifted
+                save(vp); renderBoxes();
+            }
+        }
+        $('#sheet').hidden = true;
+    };
+}
+
+/* sheet for a detected (unlabeled) sticky note */
+function labelNote(nb) {
+    if (!vp) return;
+    const val = prompt('Stock number on this note:');
+    if (!val || !val.trim()) return;
+    const cur = (vp.notes || []).indexOf(nb);   // list may have changed meanwhile
+    vp.words.push({ t: val.trim(), x0: nb.x0, y0: nb.y0, x1: nb.x1, y1: nb.y1, conf: 100, line: 0, manual: true });
+    if (cur !== -1) vp.notes.splice(cur, 1);
+    save(vp);
+    renderBoxes();
+}
+function openNoteSheet(i) {
+    const nb = vp && vp.notes && vp.notes[i];
+    if (!nb) return;
+    $('#sheet').innerHTML = `<div class="sheetbody">
+    <div class="sheettitle">Sticky note found here<b>What's the stock number?</b></div>
+    <button data-sact="label">✏️ Type the number</button>
+    <button data-sact="dismiss" class="danger">🚫 Not a label — hide this</button>
+    <button data-sact="cancel" class="cancel">Cancel</button>
+  </div>`;
+    $('#sheet').hidden = false;
+    $('#sheet').onclick = e => {
+        const b = e.target.closest('[data-sact]');
+        const act = b ? b.dataset.sact : 'cancel';
+        $('#sheet').hidden = true;
+        if (act === 'label') labelNote(nb);
+        else if (act === 'dismiss') {
+            const cur = (vp.notes || []).indexOf(nb);
+            if (cur === -1) return;
+            vp.dismissedNotes = vp.dismissedNotes || [];
+            vp.dismissedNotes.push(nb);
+            vp.notes.splice(cur, 1);
+            save(vp);
+            renderBoxes();
+        }
+    };
+}
+
+/* ================= boot ================= */
+(async function boot() {
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { }
+    try { photos = (await dbAll()).sort((a, b) => b.createdAt - a.createdAt); }
+    catch (e) { alert('Could not open on-device storage: ' + e.message); }
+    // a scan interrupted by closing the app must go back in the queue
+    photos.forEach(p => { if (p.status === 'ocr') p.status = 'queued'; });
+    render();
+    processQueue();
+})();
