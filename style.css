@@ -590,6 +590,64 @@ footer {
     color: #8b93a7
 }
 
+.btn.on {
+    background: #4f8cff;
+    border-color: #4f8cff;
+    color: #fff
+}
+
+/* all-numbers list */
+#numlist {
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px
+}
+
+.listhead {
+    font-size: 13px;
+    color: #9aa2b5;
+    padding: 2px 4px 8px
+}
+
+.numrow {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    background: #171b24;
+    border: 1px solid #232938;
+    border-radius: 12px;
+    padding: 12px 14px;
+    text-align: left
+}
+
+.numrow .numtext {
+    font-size: 16px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    flex: 1
+}
+
+.numrow .nummeta {
+    font-size: 12px;
+    color: #8b93a7
+}
+
+.numrow .soldtag {
+    font-size: 11px;
+    font-weight: 700;
+    color: #ff9f0a;
+    border: 1px solid #ff9f0a;
+    border-radius: 6px;
+    padding: 2px 6px
+}
+
+.numrow.sold .numtext {
+    color: #7c8496;
+    text-decoration: line-through
+}
+
 [hidden] {
     display: none !important
 }

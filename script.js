@@ -602,14 +602,46 @@ function chipGroups(p) {
 }
 
 /* ================= rendering ================= */
+let listMode = false;
+
 function render() {
     const q = $('#search').value.trim();
     const searching = norm(q).length >= 3;
     $('#results').hidden = !searching;
-    $('#gallery').hidden = searching;
-    $('#empty').hidden = photos.length > 0 || searching;
-    if (searching) renderResults(q); else renderGallery();
+    $('#numlist').hidden = searching || !listMode;
+    $('#gallery').hidden = searching || listMode;
+    $('#empty').hidden = photos.length > 0 || searching || listMode;
+    $('#btnList').classList.toggle('on', listMode);
+    if (searching) renderResults(q);
+    else if (listMode) renderList();
+    else renderGallery();
     updateStorage();
+}
+
+/* deduped list of every labeled stock number across all photos */
+function renderList() {
+    const m = new Map();   // normalized number -> group
+    for (const p of photos) {
+        for (const w of (p.words || [])) {
+            if (!w.manual) continue;
+            const key = norm(w.t) || w.t;
+            let g = m.get(key);
+            if (!g) { g = { text: w.t, photoIds: new Set(), sold: true }; m.set(key, g); }
+            g.photoIds.add(p.id);
+            g.sold = g.sold && !!w.sold;
+        }
+    }
+    const rows = [...m.values()].sort((a, b) => a.text.localeCompare(b.text, undefined, { numeric: true }));
+    const soldN = rows.filter(r => r.sold).length;
+    $('#numlist').innerHTML =
+        `<div class="listhead">${rows.length} stock number${rows.length === 1 ? '' : 's'} · ${rows.length - soldN} available · ${soldN} sold</div>`
+        + (rows.length
+            ? rows.map(r => `<button class="numrow${r.sold ? ' sold' : ''}" data-q="${esc(r.text)}">
+                <span class="numtext">${esc(r.text)}</span>
+                <span class="nummeta">${r.photoIds.size} photo${r.photoIds.size === 1 ? '' : 's'}</span>
+                ${r.sold ? '<span class="soldtag">SOLD</span>' : ''}
+              </button>`).join('')
+            : `<div class="resnote">No labeled numbers yet — open a photo and label its sticky notes.</div>`);
 }
 
 function badgeText(p) {
@@ -706,6 +738,19 @@ function listClick(e) {
 }
 $('#gallery').addEventListener('click', listClick);
 $('#results').addEventListener('click', listClick);
+
+/* all-numbers list */
+$('#btnList').addEventListener('click', () => {
+    listMode = !listMode;
+    if (listMode) $('#search').value = '';
+    render();
+});
+$('#numlist').addEventListener('click', e => {
+    const b = e.target.closest('.numrow');
+    if (!b) return;
+    $('#search').value = b.dataset.q;   // jump to search results for that number
+    render();
+});
 
 /* search box */
 let searchTimer = null;
@@ -837,7 +882,7 @@ function openSheet(idx) {
     $('#sheet').onclick = e => {
         const b = e.target.closest('[data-sact]');
         const act = b ? b.dataset.sact : 'cancel';   // tap outside = cancel
-        if (act === 'sold') { w.sold = !w.sold; save(vp); renderBoxes(); }
+        if (act === 'sold') { setSoldEverywhere(w, !w.sold); renderBoxes(); }
         else if (act === 'edit') {
             const v = prompt('Stock number:', w.t);
             if (v && v.trim()) { w.t = v.trim(); save(vp); renderBoxes(); }
@@ -852,6 +897,25 @@ function openSheet(idx) {
         }
         $('#sheet').hidden = true;
     };
+}
+
+/* the same box often appears in several photos — sold status follows the
+   number everywhere, so marking it once is enough */
+function setSoldEverywhere(w, sold) {
+    w.sold = sold;
+    const touched = new Set();
+    const home = photos.find(p => (p.words || []).includes(w));
+    if (home) touched.add(home);
+    const key = norm(w.t);
+    if (key) {
+        for (const p of photos)
+            for (const ww of (p.words || []))
+                if (ww !== w && norm(ww.t) === key && !!ww.sold !== sold) {
+                    ww.sold = sold;
+                    touched.add(p);
+                }
+    }
+    for (const p of touched) if (p) save(p);
 }
 
 /* sheet for a detected (unlabeled) sticky note */
